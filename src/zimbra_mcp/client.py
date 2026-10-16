@@ -1,6 +1,10 @@
 """Zimbra SOAP Client."""
 
+import re
+import urllib.error
+import urllib.request
 from typing import Any
+from urllib.parse import urlencode
 
 from pythonzimbra.communication import Communication
 from pythonzimbra.tools import auth
@@ -12,6 +16,19 @@ from zimbra_mcp.errors import (
     ZimbraNotFoundError,
     ZimbraOperationError,
 )
+
+# Fault codes meaning the auth token is no longer valid (expired, revoked...)
+_AUTH_FAULT_CODES = ("service.AUTH_EXPIRED", "service.AUTH_REQUIRED", "account.AUTH_FAILED")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the auth cookie is never forwarded to another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise urllib.error.HTTPError(req.full_url, code, f"Redirect refused ({msg})", headers, fp)
+
+
+_attachment_opener = urllib.request.build_opener(_NoRedirectHandler)
 
 
 class ZimbraClient:
@@ -30,13 +47,14 @@ class ZimbraClient:
     def connect(self) -> None:
         """Establish connection and authentication."""
         try:
-            self._comm = Communication(self.config.url)
+            self._comm = Communication(self.config.url, timeout=self.config.timeout)
 
             self._token = auth.authenticate(
                 self.config.url,
                 self.config.user,
                 self.config.password,
                 use_password=True,
+                timeout=self.config.timeout,
             )
 
             if not self._token:
@@ -45,7 +63,8 @@ class ZimbraClient:
         except ZimbraAuthError:
             raise
         except Exception as e:
-            raise ZimbraConnectionError(f"Unable to connect to Zimbra: {e}")
+            # Exception type only: never echo request details that may carry credentials
+            raise ZimbraConnectionError(f"Unable to connect to Zimbra ({type(e).__name__})") from None
 
     def disconnect(self) -> None:
         """Close the connection."""
@@ -75,6 +94,15 @@ class ZimbraClient:
         """
         self._ensure_connected()
 
+        try:
+            return self._send(request_name, namespace, params)
+        except ZimbraAuthError:
+            # Token expired or revoked: re-authenticate once and retry
+            self.disconnect()
+            self.connect()
+            return self._send(request_name, namespace, params)
+
+    def _send(self, request_name: str, namespace: str, params: dict[str, Any] | None) -> dict[str, Any]:
         if self._comm is None:
             raise ZimbraConnectionError("Client not initialized")
 
@@ -92,6 +120,12 @@ class ZimbraClient:
                 fault = fault_response.get("Fault", fault_response)
                 reason = fault.get("Reason", {})
                 error_msg = reason.get("Text", str(fault)) if isinstance(reason, dict) else str(fault)
+                try:
+                    fault_code = response.get_fault_code()
+                except Exception:
+                    fault_code = None
+                if fault_code in _AUTH_FAULT_CODES:
+                    raise ZimbraAuthError(error_msg)
                 if "no such" in error_msg.lower() or "not found" in error_msg.lower():
                     raise ZimbraNotFoundError(error_msg)
                 raise ZimbraOperationError(error_msg)
@@ -99,7 +133,7 @@ class ZimbraClient:
             response_name = request_name.replace("Request", "Response")
             return response.get_response().get(response_name, {})
 
-        except (ZimbraNotFoundError, ZimbraOperationError):
+        except (ZimbraAuthError, ZimbraNotFoundError, ZimbraOperationError):
             raise
         except Exception as e:
             raise ZimbraOperationError(f"Error during request {request_name}: {e}")
@@ -568,11 +602,12 @@ class ZimbraClient:
         }
         return self.request("ModifyContactRequest", "urn:zimbraMail", params)
 
-    def delete_contacts(self, contact_ids: list[str]) -> dict[str, Any]:
+    def delete_contacts(self, contact_ids: list[str], hard_delete: bool = False) -> dict[str, Any]:
         """Delete contacts.
 
         Args:
             contact_ids: List of contact IDs
+            hard_delete: If True, permanently delete; otherwise move to Trash
 
         Returns:
             Operation result
@@ -580,7 +615,7 @@ class ZimbraClient:
         params = {
             "action": {
                 "id": ",".join(contact_ids),
-                "op": "delete",
+                "op": "delete" if hard_delete else "trash",
             }
         }
         return self.request("ContactActionRequest", "urn:zimbraMail", params)
@@ -595,44 +630,43 @@ class ZimbraClient:
         Returns:
             Tuple of (content_bytes, filename, content_type)
         """
-        import base64
-        import urllib.request
-        import urllib.error
-        from urllib.parse import urlencode
-
         self._ensure_connected()
 
-        # Build REST URL for attachment download
-        # Format: /service/home/~/?id=<msg_id>&part=<part_id>&auth=qp&zauthtoken=<token>
-        base_url = self.config.url.replace("/service/soap", "")
-        params = urlencode({
-            "id": msg_id,
-            "part": part_id,
-            "auth": "qp",
-            "zauthtoken": self._token,
-        })
-        url = f"{base_url}/service/home/~/?{params}"
+        # The token goes in the ZM_AUTH_TOKEN cookie, never in the URL
+        # (URLs end up in proxy / access logs).
+        params = urlencode({"id": msg_id, "part": part_id})
+        url = f"{self.config.base_url}/service/home/~/?{params}"
+        max_bytes = self.config.max_attachment_bytes
 
         try:
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
-                content = response.read()
+            req = urllib.request.Request(url, headers={"Cookie": f"ZM_AUTH_TOKEN={self._token}"})
+            with _attachment_opener.open(req, timeout=self.config.timeout) as response:
+                declared = response.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    raise ZimbraOperationError(
+                        f"Attachment too large ({declared} bytes, limit {max_bytes})"
+                    )
+                content = response.read(max_bytes + 1)
+                if len(content) > max_bytes:
+                    raise ZimbraOperationError(f"Attachment too large (limit {max_bytes} bytes)")
+
                 content_type = response.headers.get("Content-Type", "application/octet-stream")
 
-                # Extract filename from Content-Disposition header
+                # Extract filename from Content-Disposition header (untrusted: sanitized by caller)
                 content_disp = response.headers.get("Content-Disposition", "")
                 filename = "attachment"
                 if "filename=" in content_disp:
-                    import re
                     match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', content_disp)
                     if match:
                         filename = match.group(1).strip()
 
                 return content, filename, content_type
 
+        except ZimbraOperationError:
+            raise
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise ZimbraNotFoundError(f"Attachment not found: msg_id={msg_id}, part_id={part_id}")
-            raise ZimbraOperationError(f"Failed to download attachment: {e}")
+            raise ZimbraOperationError(f"Failed to download attachment: HTTP {e.code}")
         except Exception as e:
-            raise ZimbraOperationError(f"Failed to download attachment: {e}")
+            raise ZimbraOperationError(f"Failed to download attachment ({type(e).__name__})")

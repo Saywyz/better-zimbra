@@ -103,3 +103,39 @@ class TestZimbraConfig:
 
         cfg = ZimbraConfig.from_env()
         assert cfg.enable_send is False
+
+
+class TestConfigSecurity:
+    def test_plain_http_refused(self):
+        with pytest.raises(ValueError, match="HTTP"):
+            ZimbraConfig(url="http://z.test/service/soap", user="u", password="p")
+
+    def test_plain_http_opt_in(self):
+        cfg = ZimbraConfig(url="http://z.test/service/soap", user="u", password="p", allow_insecure_http=True)
+        assert cfg.base_url == "http://z.test"
+
+    def test_invalid_scheme_refused(self):
+        with pytest.raises(ValueError):
+            ZimbraConfig(url="file:///etc/passwd", user="u", password="p")
+
+    def test_password_not_in_repr(self):
+        cfg = ZimbraConfig(url="https://z.test/service/soap", user="u", password="hunter2")
+        assert "hunter2" not in repr(cfg)
+
+    def test_base_url(self):
+        cfg = ZimbraConfig(url="https://z.test:8443/service/soap", user="u", password="p")
+        assert cfg.base_url == "https://z.test:8443"
+
+    def test_safe_defaults(self):
+        cfg = ZimbraConfig(url="https://z.test/service/soap", user="u", password="p")
+        assert cfg.enable_send is False
+        assert cfg.enable_hard_delete is False
+
+    @patch("zimbra_mcp.config.load_dotenv")
+    def test_invalid_timeout(self, _mock_dotenv, monkeypatch):
+        monkeypatch.setenv("ZIMBRA_URL", "https://z.test/service/soap")
+        monkeypatch.setenv("ZIMBRA_USER", "u")
+        monkeypatch.setenv("ZIMBRA_PASSWORD", "p")
+        monkeypatch.setenv("ZIMBRA_TIMEOUT", "abc")
+        with pytest.raises(ValueError, match="ZIMBRA_TIMEOUT"):
+            ZimbraConfig.from_env()

@@ -93,3 +93,11 @@ cython_debug/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code (local AI assistant config)
+CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.md
+**/CLAUDE.local.md
+.claude/
+.mcp.json

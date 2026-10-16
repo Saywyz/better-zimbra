@@ -49,7 +49,8 @@ class TestConnection:
         client.connect()
         assert client.is_connected
         assert client._token == "tok123"
-        mock_comm_cls.assert_called_once_with(client.config.url)
+        mock_comm_cls.assert_called_once_with(client.config.url, timeout=client.config.timeout)
+        assert mock_auth.call_args.kwargs["timeout"] == client.config.timeout
 
     @patch("zimbra_mcp.client.auth.authenticate", return_value=None)
     @patch("zimbra_mcp.client.Communication")
@@ -60,8 +61,15 @@ class TestConnection:
     @patch("zimbra_mcp.client.auth.authenticate", side_effect=Exception("network"))
     @patch("zimbra_mcp.client.Communication")
     def test_connect_network_failure(self, mock_comm_cls, mock_auth, client):
-        with pytest.raises(ZimbraConnectionError, match="network"):
+        with pytest.raises(ZimbraConnectionError, match="Exception"):
             client.connect()
+
+    @patch("zimbra_mcp.client.auth.authenticate", side_effect=Exception("password=secret"))
+    @patch("zimbra_mcp.client.Communication")
+    def test_connect_error_does_not_leak_details(self, mock_comm_cls, mock_auth, client):
+        with pytest.raises(ZimbraConnectionError) as exc:
+            client.connect()
+        assert "secret" not in str(exc.value)
 
     def test_disconnect(self, connected_client):
         connected_client.disconnect()
@@ -474,4 +482,109 @@ class TestDeleteContacts:
         connected_client.delete_contacts(["100", "101"])
         params = _get_request_params(connected_client)
         assert params["action"]["id"] == "100,101"
+        assert params["action"]["op"] == "trash"
+
+    def test_hard_delete(self, connected_client):
+        resp = _make_ok_response("ContactActionResponse", {"action": {}})
+        _setup_response(connected_client, resp)
+
+        connected_client.delete_contacts(["100"], hard_delete=True)
+        params = _get_request_params(connected_client)
         assert params["action"]["op"] == "delete"
+
+
+# --- Security tests ---
+
+
+class TestTokenRefresh:
+    @staticmethod
+    def _auth_fault(code):
+        fault = MagicMock()
+        fault.is_fault.return_value = True
+        fault.get_fault_code.return_value = code
+        fault.get_response.return_value = {"Fault": {"Reason": {"Text": "auth credentials have expired"}}}
+        return fault
+
+    @staticmethod
+    def _fake_connect(connected_client, comm):
+        def fake_connect():
+            connected_client._comm = comm
+            connected_client._token = "new-token"
+        return fake_connect
+
+    def test_reconnects_once_on_expired_token(self, connected_client):
+        ok = _make_ok_response("TestResponse", {"data": "ok"})
+        comm = connected_client._comm
+        comm.send_request.side_effect = [self._auth_fault("service.AUTH_EXPIRED"), ok]
+
+        with patch.object(
+            connected_client, "connect", side_effect=self._fake_connect(connected_client, comm)
+        ) as mock_connect:
+            result = connected_client.request("TestRequest", "urn:test")
+
+        assert result == {"data": "ok"}
+        mock_connect.assert_called_once()
+        assert connected_client._token == "new-token"
+
+    def test_gives_up_after_one_retry(self, connected_client):
+        comm = connected_client._comm
+        comm.send_request.return_value = self._auth_fault("service.AUTH_REQUIRED")
+
+        with patch.object(connected_client, "connect", side_effect=self._fake_connect(connected_client, comm)):
+            with pytest.raises(ZimbraAuthError):
+                connected_client.request("TestRequest", "urn:test")
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body, headers):
+        self._body = body
+        self.headers = headers
+
+    def read(self, n=-1):
+        return self._body if n < 0 else self._body[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestAttachmentDownload:
+    def test_token_sent_in_cookie_not_url(self, connected_client):
+        resp = _FakeHTTPResponse(
+            b"data",
+            {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="a.txt"'},
+        )
+        with patch("zimbra_mcp.client._attachment_opener.open", return_value=resp) as mock_open:
+            content, filename, _ = connected_client.get_attachment_content("1", "2")
+
+        req = mock_open.call_args[0][0]
+        assert "fake-token" not in req.full_url
+        assert "zauthtoken" not in req.full_url
+        assert req.get_header("Cookie") == "ZM_AUTH_TOKEN=fake-token"
+        assert req.full_url.startswith("https://zimbra.test/service/home/~/?")
+        assert (content, filename) == (b"data", "a.txt")
+
+    def test_size_limit_enforced(self, connected_client):
+        connected_client.config.max_attachment_bytes = 10
+        resp = _FakeHTTPResponse(b"x" * 50, {})
+        with patch("zimbra_mcp.client._attachment_opener.open", return_value=resp):
+            with pytest.raises(ZimbraOperationError, match="too large"):
+                connected_client.get_attachment_content("1", "2")
+
+    def test_declared_size_limit_enforced(self, connected_client):
+        connected_client.config.max_attachment_bytes = 10
+        resp = _FakeHTTPResponse(b"", {"Content-Length": "1000"})
+        with patch("zimbra_mcp.client._attachment_opener.open", return_value=resp):
+            with pytest.raises(ZimbraOperationError, match="too large"):
+                connected_client.get_attachment_content("1", "2")
+
+    def test_redirects_are_refused(self):
+        import urllib.request
+
+        from zimbra_mcp.client import _NoRedirectHandler
+
+        req = urllib.request.Request("https://zimbra.test/x", headers={"Cookie": "ZM_AUTH_TOKEN=t"})
+        with pytest.raises(Exception, match="Redirect refused"):
+            _NoRedirectHandler().redirect_request(req, None, 302, "Found", {}, "https://evil.test/")

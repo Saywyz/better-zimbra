@@ -15,6 +15,8 @@ from zimbra_mcp.tools.emails import (
     _guess_extension,
     _html_to_text,
     _prepare_body_with_original,
+    _resolve_inside,
+    _safe_filename,
     register_email_tools,
 )
 
@@ -163,8 +165,18 @@ class TestDeleteEmailsTool:
         assert result["deleted_count"] == 2
         assert result["hard_delete"] is False
 
-    def test_hard_delete(self, email_tools):
+    def test_hard_delete_refused_by_default(self, email_tools):
         tools, client = email_tools
+        client.delete_messages = MagicMock()
+
+        result = tools["delete_emails"](["5"], hard_delete=True)
+
+        client.delete_messages.assert_not_called()
+        assert result["success"] is False
+
+    def test_hard_delete_when_enabled(self, email_tools):
+        tools, client = email_tools
+        client.config.enable_hard_delete = True
         client.delete_messages = MagicMock()
 
         result = tools["delete_emails"](["5"], hard_delete=True)
@@ -368,3 +380,82 @@ class TestSendEmailToolRegistration:
         connected_client.send_message.assert_called_once()
         assert result["success"] is True
         assert result["message_id"] == "200"
+
+
+class TestSafeFilename:
+    @pytest.mark.parametrize("raw, expected", [
+        ("report.pdf", "report.pdf"),
+        ("../../.bashrc", "bashrc"),
+        ("..\\..\\Windows\\evil.exe", "evil.exe"),
+        ("/etc/passwd", "passwd"),
+        ("C:\\Users\\x\\AppData\\run.bat", "run.bat"),
+        ("a<b>c:d.txt", "a_b_c_d.txt"),
+        ("a\x00b\n.txt", "a_b_.txt"),
+        ("..", ""),
+        ("", ""),
+        ("CON.txt", "_CON.txt"),
+    ])
+    def test_sanitize(self, raw, expected):
+        assert _safe_filename(raw) == expected
+
+
+class TestResolveInside:
+    def test_default_is_root(self, tmp_path):
+        assert _resolve_inside(tmp_path, None) == tmp_path
+
+    def test_subdir_allowed(self, tmp_path):
+        assert _resolve_inside(tmp_path, "sub") == (tmp_path / "sub").resolve()
+
+    def test_traversal_refused(self, tmp_path):
+        assert _resolve_inside(tmp_path, "../outside") is None
+
+    def test_absolute_outside_refused(self, tmp_path):
+        assert _resolve_inside(tmp_path / "root", str(tmp_path)) is None
+
+
+class TestDownloadAttachmentTool:
+    @pytest.fixture
+    def setup(self, email_tools, tmp_path):
+        tools, client = email_tools
+        root = tmp_path.resolve()
+        client.config.download_dir = root
+        return tools, client, root
+
+    def test_saves_in_download_dir(self, setup):
+        tools, client, root = setup
+        client.get_attachment_content = MagicMock(return_value=(b"abc", "doc.pdf", "application/pdf"))
+
+        result = tools["download_attachment"]("1", "2")
+
+        assert result["success"] is True
+        assert (root / "doc.pdf").read_bytes() == b"abc"
+
+    def test_malicious_original_filename_stays_in_dir(self, setup):
+        tools, client, root = setup
+        client.get_attachment_content = MagicMock(return_value=(b"x", "../../evil.sh", "text/plain"))
+
+        result = tools["download_attachment"]("1", "2")
+
+        assert result["success"] is True
+        assert (root / "evil.sh").exists()
+        assert not (root.parent.parent / "evil.sh").exists()
+
+    def test_save_path_outside_refused(self, setup):
+        tools, client, _ = setup
+        client.get_attachment_content = MagicMock()
+
+        result = tools["download_attachment"]("1", "2", save_path="..")
+
+        assert result["success"] is False
+        client.get_attachment_content.assert_not_called()
+
+    def test_never_overwrites(self, setup):
+        tools, client, root = setup
+        (root / "doc.pdf").write_bytes(b"original")
+        client.get_attachment_content = MagicMock(return_value=(b"new", "doc.pdf", "application/pdf"))
+
+        result = tools["download_attachment"]("1", "2")
+
+        assert (root / "doc.pdf").read_bytes() == b"original"
+        assert result["filename"] == "doc (1).pdf"
+        assert (root / "doc (1).pdf").read_bytes() == b"new"
