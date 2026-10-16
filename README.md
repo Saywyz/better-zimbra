@@ -149,21 +149,10 @@ The server runs **locally**, as a child process of the MCP client (Claude Deskto
 
 ```mermaid
 flowchart LR
-    subgraph local["Your machine"]
-        LLM["MCP client<br/>(Claude Desktop / Code)"]
-        MCP["zimbra-mcp<br/>(Python process)"]
-        ENV[".env / env vars<br/>URL, user, password"]
-        DL[("ZIMBRA_DOWNLOAD_DIR<br/>attachments")]
-    end
-    ZIMBRA["Zimbra server<br/>/service/soap<br/>/service/home/~/"]
-    MODEL["LLM provider<br/>(e.g. Anthropic API)"]
-
-    ENV -- "read at startup" --> MCP
-    LLM <-- "stdio: JSON-RPC<br/>tool calls / results" --> MCP
-    MCP <-- "HTTPS: SOAP JSON<br/>authToken in body" --> ZIMBRA
-    MCP -- "HTTPS GET + cookie<br/>ZM_AUTH_TOKEN" --> ZIMBRA
-    MCP -- "write file" --> DL
-    LLM <-- "conversation, incl.<br/>tool results" --> MODEL
+    MODEL["LLM<br/>(Anthropic...)"] <--> CLIENT["MCP client<br/>(Claude)"]
+    CLIENT <-- stdio --> MCP["zimbra-mcp"]
+    MCP <-- HTTPS --> ZIMBRA["Zimbra server"]
+    MCP --> DL[("Download dir")]
 ```
 
 **Where your data goes**
